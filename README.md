@@ -1,6 +1,6 @@
 # ai-infra
 
-Central source of truth for my own AI tooling config (Claude Code, Codex).
+Central source of truth for my own AI tooling config (Claude Code).
 
 - `skills/` own skills, symlinked into each tool's skills dir
 - `agents/` own agents
