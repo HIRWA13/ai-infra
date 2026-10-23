@@ -1,0 +1,6 @@
+*.env
+!*.env.example
+secrets*
+*.bak
+*.tgz
+.DS_Store
