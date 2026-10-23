@@ -5,3 +5,4 @@ secrets*
 *.tgz
 .DS_Store
 !secrets.env.example
+!config.env

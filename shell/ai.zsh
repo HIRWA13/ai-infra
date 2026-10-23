@@ -1,6 +1,9 @@
-# Claude Code launcher helpers. Secrets come from ~/.config/ai/secrets.env.
-_AI_SECRETS="$HOME/.config/ai/secrets.env"
-[ -r "$_AI_SECRETS" ] && { set -a; source "$_AI_SECRETS"; set +a; }
+# Claude Code launcher helpers. Config: ~/ai/config.env (tracked). Tokens: ~/ai/secrets/secrets.env (gitignored).
+_AI_HOME="${${(%):-%x}:A:h:h}"
+for _f in "$_AI_HOME/config.env" "$_AI_HOME/secrets/secrets.env"; do
+  [ -r "$_f" ] && { set -a; source "$_f"; set +a; }
+done
+unset _f
 
 export ANTHROPIC_BASE_URL="$AI_BASE_URL"
 export ANTHROPIC_MODEL="$AI_MODEL"
