@@ -1,0 +1,35 @@
+{
+  "env": {
+    "TAVILY_API_KEY": ""
+  },
+  "permissions": {
+    "allow": [
+      "WebSearch"
+    ]
+  },
+  "model": "opus",
+  "enabledMcpjsonServers": [
+    "tavily"
+  ],
+  "statusLine": {
+    "type": "command",
+    "command": "/Users/Junior.Hirwa/.claude/statusline-command.sh"
+  },
+  "enabledPlugins": {
+    "github@claude-plugins-official": true,
+    "figma@claude-plugins-official": true,
+    "frontend-design@claude-plugins-official": true,
+    "mattpocock-skills@mattpocock": true
+  },
+  "extraKnownMarketplaces": {
+    "mattpocock": {
+      "source": {
+        "source": "github",
+        "repo": "mattpocock/skills"
+      }
+    }
+  },
+  "tui": "fullscreen",
+  "skipWorkflowUsageWarning": true,
+  "autoCompactEnabled": false
+}
