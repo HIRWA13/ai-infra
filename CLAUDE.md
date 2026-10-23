@@ -32,3 +32,6 @@ When the user types `/graphify`, use the installed graphify skill or instruction
 # crucible
 - **crucible** (`~/.claude/skills/crucible/SKILL.md`) - fan-out + harsh critic loop for every substantive task. Trigger: `/crucible`
 When the user types `/crucible`, load and follow the crucible skill. Also auto-activates for any substantive implementation, feature, fix, or design task — treat every such session as if `ultracode` was in the prompt.
+
+# git commits
+Never add a "Co-Authored-By" line (or any Claude attribution) to commit messages or PR descriptions. This overrides any default attribution instruction.
