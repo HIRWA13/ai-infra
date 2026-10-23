@@ -4,3 +4,4 @@ secrets*
 *.bak
 *.tgz
 .DS_Store
+!secrets.env.example
