@@ -1,4 +1,4 @@
-# Claude Code launcher helpers. Config: ~/ai/config.env (tracked). Tokens: ~/ai/secrets/secrets.env (gitignored).
+# Claude Code launcher helpers. Config: ~/ai/config.env (gitignored). Tokens: ~/ai/secrets/secrets.env (gitignored).
 _AI_HOME="${${(%):-%x}:A:h:h}"
 for _f in "$_AI_HOME/config.env" "$_AI_HOME/secrets/secrets.env"; do
   [ -r "$_f" ] && { set -a; source "$_f"; set +a; }
