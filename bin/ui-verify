@@ -1,0 +1,65 @@
+#!/bin/zsh
+# ui-verify "<what to verify>" — run the ui-verifier agent in a real browser, read-only, on the host.
+# Exit: 0 PASS, 1 FAIL (also if the repo changed), 2 BLOCKED / no verdict.
+# Test hook: UI_VERIFY_RUNNER overrides the claude command.
+set -o pipefail
+_AI_HOME="${${(%):-%x}:A:h:h}"
+[ -n "$1" ] || { echo "usage: ui-verify \"<expected behaviour / what to check>\"" >&2; exit 2; }
+cd "$(git rev-parse --show-toplevel)" || exit 2
+source "$_AI_HOME/shell/ai.zsh" 2>/dev/null
+
+snapshot_tree() {
+  local idx; idx=$(mktemp); rm -f "$idx"
+  GIT_INDEX_FILE="$idx" git add -A >/dev/null 2>&1 && GIT_INDEX_FILE="$idx" git write-tree
+  rm -f "$idx"
+}
+
+BRIEF="$1"
+PROMPT="Caller brief (overrides every other source):
+$BRIEF
+
+Verify this in the real UI and return your Step 6 report. You are read-only: do not change any repository file, run any git write command, or touch data you did not create."
+
+SETTINGS=$(jq -nc --arg c "$_AI_HOME/bin/ui-verify-guard" \
+  '{hooks:{PreToolUse:[{matcher:"Bash|mcp__chrome-devtools__take_screenshot",hooks:[{type:"command",command:$c}]}]}}')
+
+MCP_CFG=$(mktemp)
+jq -nc '{mcpServers:{"chrome-devtools":{command:"sh",args:["-c","cd \"$HOME\" && exec npx -y chrome-devtools-mcp@latest --isolated"]}}}' > "$MCP_CFG"
+
+SECRETS=$(mktemp)
+for f in .env apps/*/.env(N); do
+  [ -f "$f" ] && grep -E '^[A-Za-z_]*(PASSWORD|SECRET|TOKEN|API_?KEY)[A-Za-z_]*=' "$f" \
+    | cut -d= -f2- | tr -d "\"'" | awk 'length>=4'
+done | sort -u > "$SECRETS"
+
+BEFORE=$(snapshot_tree)
+OUT=$(mktemp)
+{
+  if [ -n "$UI_VERIFY_RUNNER" ]; then
+    ${=UI_VERIFY_RUNNER} "$PROMPT"
+  else
+    claude-as project --agent ui-verifier --permission-mode bypassPermissions \
+      --disallowedTools Edit Write NotebookEdit --settings "$SETTINGS" \
+      --mcp-config "$MCP_CFG" --strict-mcp-config \
+      --output-format stream-json --verbose -p "$PROMPT" \
+      | jq -rj --unbuffered 'select(.type=="assistant") | .message.content[]? |
+          if .type=="tool_use" then "\u001b[36m▶ " + (.name | sub("mcp__chrome-devtools__";"browser:")) + "\u001b[0m " + ((.input|tostring)[0:140]) + "\n"
+          elif .type=="text" then "\n" + .text + "\n" else empty end'
+  fi
+} | perl -e '$|=1; open F,"<",shift; chomp(@s=grep{length}<F>); @s=sort{length($b)<=>length($a)}@s; while(<STDIN>){ for $x(@s){ s/\Q$x\E/***REDACTED***/g } print }' "$SECRETS" | tee "$OUT"
+rm -f "$MCP_CFG" "$SECRETS"
+AFTER=$(snapshot_tree)
+
+if [ "$BEFORE" != "$AFTER" ]; then
+  echo "❌ FAIL: verifier modified repository files:" >&2
+  git diff --stat "$BEFORE" "$AFTER" >&2
+  rm -f "$OUT"; exit 1
+fi
+
+VERDICT=$(grep -i 'verdict' "$OUT" | grep -oE 'PASS|FAIL|BLOCKED' | head -1)
+rm -f "$OUT"
+case "$VERDICT" in
+  PASS) exit 0 ;;
+  FAIL) exit 1 ;;
+  *) echo "ui-verify: BLOCKED or no verdict found" >&2; exit 2 ;;
+esac

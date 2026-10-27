@@ -56,7 +56,7 @@ The shell may use a Node version that the repository pins. Run project commands 
 
 Drive the real login form with the browser tools. Do not call the API directly, and do not inject tokens. Complete every login step, including tenant selection. Use the credentials from the project's `.env` files. Use the default tenant unless the caller named another one.
 
-Take a text snapshot to find elements. Take screenshots only as evidence. Save screenshots to the temp directory.
+Take a text snapshot to find elements. Take screenshots only as evidence, at most one per scenario, and only for a FAIL or a key state. Always pass `filePath` under /tmp (e.g. /tmp/ui-verify-<n>.png); a screenshot without filePath is attached inline, fills the context and kills the run. Prefer take_snapshot (text) and list_network_requests for checks. Never fetch large network bodies or full-page snapshots repeatedly.
 
 # Step 5: Verify
 

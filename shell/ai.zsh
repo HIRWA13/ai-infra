@@ -4,6 +4,7 @@ for _f in "$_AI_HOME/config.env" "$_AI_HOME/secrets/secrets.env"; do
   [ -r "$_f" ] && { set -a; source "$_f"; set +a; }
 done
 unset _f
+export PATH="$_AI_HOME/bin:$PATH"
 
 export ANTHROPIC_BASE_URL="$AI_BASE_URL"
 export ANTHROPIC_MODEL="$AI_MODEL"

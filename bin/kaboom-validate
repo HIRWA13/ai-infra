@@ -1,0 +1,36 @@
+#!/bin/zsh
+# kaboom-validate [prd.json] — check a kaboom queue is consistent. Exit 1 on any problem.
+cd "$(git rev-parse --show-toplevel)" 2>/dev/null
+PRD="${1:-}"
+if [ -z "$PRD" ]; then
+  for d in "${KABOOM_DIR:-}" tmp/kaboom kaboom ralph; do [ -n "$d" ] && [ -f "$d/prd.json" ] && { PRD="$d/prd.json"; break; }; done
+fi
+[ -f "$PRD" ] || { echo "prd.json not found" >&2; exit 1; }
+jq -e '.issues | type == "array"' "$PRD" >/dev/null || { echo "FAIL: .issues is not an array" >&2; exit 1; }
+
+errs=0
+err() { echo "FAIL: $*" >&2; errs=$((errs+1)); }
+
+dups=$(jq -r '.issues | group_by(.id)[] | select(length>1) | .[0].id' "$PRD")
+[ -n "$dups" ] && while read -r d; do err "duplicate id: $d"; done <<< "$dups"
+
+while IFS= read -r l; do err "$l"; done < <(jq -r '
+  (.issues | map(.id)) as $ids |
+  .issues[] | . as $i |
+  (if (($i.id // "") == "") then "issue without id" else empty end),
+  (if (["pending","blocked","done"] | index($i.status)) == null then "\($i.id): bad status \($i.status)" else empty end),
+  (if ($i.blocked_by | type) != "array" then "\($i.id): blocked_by must be an array" else
+     ($i.blocked_by[] | select(. as $b | $ids | index($b) == null) | "\($i.id): blocked_by unknown id \(.)") end),
+  (if ($i.files | type) != "array" then "\($i.id): files must be an array" else empty end),
+  (if (($i.spec // "") == "") then "\($i.id): missing spec" else empty end)
+' "$PRD")
+
+while IFS=$'\x1f' read -r id spec task; do
+  [ -f "$spec" ] || { err "$id: spec not found: $spec"; continue }
+  if [ -n "$task" ] && ! grep -qFe "- [ ] $task" "$spec" && ! grep -qFe "- [x] $task" "$spec"; then
+    err "$id: task text not found verbatim in $spec"
+  fi
+done < <(jq -r '.issues[] | [.id, .spec, (.task // "")] | join("\u001f")' "$PRD")
+
+[ "$errs" -eq 0 ] && echo "OK: $(jq '.issues|length' "$PRD") tasks valid ($PRD)"
+[ "$errs" -eq 0 ]

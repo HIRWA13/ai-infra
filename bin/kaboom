@@ -1,0 +1,374 @@
+#!/bin/zsh
+# kaboom — deterministic task loop. Picks the next unblocked task from prd.json,
+# runs one agent session on it, verifies, marks it done, commits per ticket.
+# Usage: kaboom [max-iterations]      (KABOOM_DRY=1 kaboom  → print first prompt, no agent)
+# Per-project state dir (prd.json, progress.txt): $KABOOM_DIR, else ./tmp/kaboom, else ./kaboom, else ./ralph (legacy).
+# Settings: ./kaboom/config.env (if any), then <dir>/config.env.
+set -eo pipefail
+
+_KABOOM_SELF="${${(%):-%x}:A}"
+_AI_HOME="${_KABOOM_SELF:h:h}"
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Defaults, overridable in <dir>/config.env
+if [ -n "$KABOOM_DIR" ]; then DIR="$KABOOM_DIR"
+elif [ -d tmp/kaboom ]; then DIR="tmp/kaboom"
+elif [ -d kaboom ]; then DIR="kaboom"
+elif [ -d ralph ]; then DIR="ralph"
+else echo "Error: no tmp/kaboom, kaboom or ralph directory in $(pwd)." >&2; exit 1
+fi
+PRD_FILE="$DIR/prd.json"
+PROGRESS_FILE="$DIR/progress.txt"
+SPECS_DIR=".scratch"
+VERIFY_CMD=""
+VERIFY_TIMEOUT=120
+RUNNER="sbx-project"
+RUNNER_ARGS="--permission-mode acceptEdits"
+COMMIT_TYPE="feat"
+REVIEW=""
+REVIEW_RUNNER=""
+REVIEW_RUNNER_ARGS="--permission-mode plan"
+REVIEW_PROMPT_FILE="$_AI_HOME/prompts/reviewer.md"
+REVIEW_MAX_DIFF=60000
+UI_VERIFY=""
+UI_PATHS=""
+[ -r kaboom/config.env ] && [ "$DIR" != "kaboom" ] && { set -a; source kaboom/config.env; set +a; }
+[ -r "$DIR/config.env" ] && { set -a; source "$DIR/config.env"; set +a; }
+
+MAX_ITERATIONS="${1:-100}"
+
+if [ -z "$KABOOM_DRY" ]; then
+  mkdir "$DIR/.lock" 2>/dev/null || { echo "Error: another kaboom run is active in this project ($DIR/.lock). Remove it if stale." >&2; exit 1; }
+  trap 'rmdir "$DIR/.lock" 2>/dev/null' EXIT
+fi
+
+command -v jq >/dev/null 2>&1 || { echo "Error: 'jq' is required." >&2; exit 1; }
+command -v git >/dev/null 2>&1 || { echo "Error: 'git' is required." >&2; exit 1; }
+command -v perl >/dev/null 2>&1 || { echo "Error: 'perl' is required (portable timeout)." >&2; exit 1; }
+[ -f "$PRD_FILE" ] || { echo "Error: $PRD_FILE not found." >&2; exit 1; }
+
+# Runner functions (sbx-project etc.) live in ai.zsh
+source "$_AI_HOME/shell/ai.zsh" 2>/dev/null || true
+if [ -z "$KABOOM_DRY" ]; then
+  whence -w "$RUNNER" >/dev/null 2>&1 || { echo "Error: runner '$RUNNER' not found." >&2; exit 1; }
+  [ "$RUNNER" = "sbx-project" ] || [ "$RUNNER" = "sbx-ojemba" ] && { command -v sbx >/dev/null 2>&1 || { echo "Error: 'sbx' is required." >&2; exit 1; }; }
+fi
+
+# timeout that works on stock macOS
+run_with_timeout() { local secs="$1"; shift; perl -e 'alarm shift; exec @ARGV' "$secs" "$@"; }
+
+snapshot_tree() { # tree of the working dir (incl. untracked, minus ignored) without touching the real index
+  local idx; idx=$(mktemp); rm -f "$idx"
+  GIT_INDEX_FILE="$idx" git add -A >/dev/null 2>&1 && GIT_INDEX_FILE="$idx" git write-tree
+  rm -f "$idx"
+}
+
+save_note() { # $1 id, $2 reason
+  local tmp; tmp=$(mktemp)
+  jq --arg id "$1" --arg reason "$2" '(.issues[] | select(.id == $id)).notes = $reason' "$PRD_FILE" > "$tmp" && mv "$tmp" "$PRD_FILE"
+  echo "📝 Notes saved. Task remains pending for next run."
+}
+
+echo "💥 KABOOM (dir: $DIR, max iterations: $MAX_ITERATIONS)"
+
+for ((i=1; i<=MAX_ITERATIONS; i++)); do
+  echo "--------------------------------------------------------"
+  echo "🔄 Iteration $i of $MAX_ITERATIONS"
+  echo "--------------------------------------------------------"
+
+  NEXT_TASK=$(jq -c '.issues[] | select(.status == "pending" and (.blocked_by | length == 0))' "$PRD_FILE" | head -n 1)
+
+  if [ -z "$NEXT_TASK" ]; then
+    PENDING_OR_BLOCKED=$(jq -r '.issues[] | select(.status == "pending" or .status == "blocked") | .id' "$PRD_FILE")
+    if [ -z "$PENDING_OR_BLOCKED" ]; then
+      echo "🎉 ALL TASKS COMPLETE!"
+      exit 0
+    else
+      echo "⚠️ No unblocked pending tasks. Blocked tasks remain:"
+      echo "$PENDING_OR_BLOCKED"
+      exit 1
+    fi
+  fi
+
+  TASK_ID=$(printf '%s\n' "$NEXT_TASK" | jq -r '.id')
+  TASK_TITLE=$(printf '%s\n' "$NEXT_TASK" | jq -r '.title')
+  TASK_SPEC=$(printf '%s\n' "$NEXT_TASK" | jq -r '.spec')
+  TASK_FILES=$(printf '%s\n' "$NEXT_TASK" | jq -r '.files | join(", ")')
+  TASK_TASK=$(printf '%s\n' "$NEXT_TASK" | jq -r '.task // empty')
+  TASK_PARENT=$(printf '%s\n' "$NEXT_TASK" | jq -r '.parent // empty')
+
+  echo "📌 Task: [$TASK_ID] $TASK_TITLE"
+  [ -n "$TASK_PARENT" ] && echo "🗂️  Ticket: [$TASK_PARENT]"
+  echo "📄 Spec: $TASK_SPEC"
+  echo "📁 Files: $TASK_FILES"
+
+  if [ ! -f "$TASK_SPEC" ]; then
+    echo "❌ Error: Spec file '$TASK_SPEC' does not exist."
+    exit 1
+  fi
+
+  echo ""
+  echo "📋 Checklist:"
+  while IFS= read -r line; do
+    if [[ "$line" == "- [ ]"* ]]; then
+      TEXT="${line#"- [ ] "}"
+      if [ -n "$TASK_TASK" ] && [ "$TEXT" = "$TASK_TASK" ]; then
+        echo "  ▶️   $TEXT  ← THIS TASK"
+      else
+        echo "  ⬜  $TEXT"
+      fi
+    elif [[ "$line" == "- [x]"* ]]; then
+      echo "  ✅  ${line#"- [x] "}"
+    fi
+  done < "$TASK_SPEC"
+  echo ""
+
+  TASK_NOTES=$(printf '%s\n' "$NEXT_TASK" | jq -r '.notes // empty')
+  PREVIOUS_ATTEMPT=""
+  if [ -n "$TASK_NOTES" ]; then
+    PREVIOUS_ATTEMPT="
+
+PREVIOUS ATTEMPT NOTES (read carefully before starting):
+$TASK_NOTES"
+  fi
+
+  if [ -n "$TASK_TASK" ]; then
+    TASK_PROMPT="You are working on task '$TASK_ID' (ticket '$TASK_PARENT').
+
+Read the full spec for context: @$TASK_SPEC
+Files in scope: $TASK_FILES
+Recent git history: $(git log --oneline -10)$PREVIOUS_ATTEMPT
+
+Your single acceptance criterion to implement:
+  $TASK_TASK
+
+INSTRUCTIONS:
+1. Read @$TASK_SPEC to understand the full design constraints and context.
+2. Implement ONLY this acceptance criterion: $TASK_TASK
+3. Do NOT implement other items from the spec checklist.
+4. Do NOT touch files outside the scope of this task.
+5. Run typechecks and tests to verify your work.
+6. Update the spec: change exactly \`- [ ] $TASK_TASK\` to \`- [x] $TASK_TASK\`. Check ONLY this one item.
+7. Do NOT commit. Kaboom commits once all sub-tasks for this ticket are done.
+8. If blocked, output <blocked>REASON</blocked> and stop.
+
+Implement this one criterion only. Do not start on downstream tasks."
+  else
+    TASK_PROMPT="You are working on task '$TASK_ID': '$TASK_TITLE'.
+
+Read the spec carefully: @$TASK_SPEC
+Files in scope: $TASK_FILES
+Recent git history for context: $(git log --oneline -10)$PREVIOUS_ATTEMPT
+
+INSTRUCTIONS:
+1. Read the spec file @$TASK_SPEC and implement exactly what it describes.
+2. Do NOT touch files outside the scope of this task.
+3. Run typechecks and tests to verify your implementation is correct.
+4. After completing ALL acceptance criteria, update the spec file $TASK_SPEC — change each \`- [ ]\` to \`- [x]\` for every item you implemented. Every checkbox must be checked before you commit.
+5. Do NOT commit. Kaboom handles the commit after the task is verified.
+6. If you cannot complete the task due to a blocker, output <blocked>REASON</blocked> and stop.
+
+ONLY implement this single task. Do not start on downstream tasks."
+  fi
+
+  if [ -n "$KABOOM_DRY" ]; then
+    echo "🧪 DRY RUN — prompt that would be sent via '$RUNNER $RUNNER_ARGS':"
+    echo "$TASK_PROMPT"
+    echo "🧪 Verify command: ${VERIFY_CMD:-<none>} (timeout ${VERIFY_TIMEOUT}s)"
+    exit 0
+  fi
+
+  BASE_TREE=""
+  [ -n "$REVIEW$UI_VERIFY" ] && BASE_TREE=$(snapshot_tree)
+
+  echo "🤖 Launching agent ($RUNNER)..."
+  RESULT_FILE=$(mktemp)
+  ${=RUNNER} ${=RUNNER_ARGS} -p "$TASK_PROMPT" | tee "$RESULT_FILE"
+  RESULT=$(cat "$RESULT_FILE")
+  rm -f "$RESULT_FILE"
+
+  if echo "$RESULT" | grep -q "<blocked>"; then
+    REASON=$(echo "$RESULT" | grep -o '<blocked>.*</blocked>' | sed 's/<blocked>//;s/<\/blocked>//')
+    echo "🚫 Task $TASK_ID could not complete: $REASON"
+    save_note "$TASK_ID" "$REASON"
+    exit 1
+  fi
+
+  echo "🔍 Verifying spec..."
+  if [ -n "$TASK_TASK" ]; then
+    # -e keeps grep from parsing a leading "- " as an option
+    if ! grep -qFe "- [x] $TASK_TASK" "$TASK_SPEC"; then
+      REASON="Spec checkbox not marked done: $TASK_TASK"
+      echo "❌ $REASON"
+      save_note "$TASK_ID" "$REASON"
+      exit 1
+    fi
+    echo "  ✅ Checkbox verified."
+  else
+    UNCHECKED=$(grep -c '^\- \[ \]' "$TASK_SPEC" || true)
+    if [ "$UNCHECKED" -gt 0 ]; then
+      echo "❌ $UNCHECKED unchecked item(s) remain in spec."
+      save_note "$TASK_ID" "$UNCHECKED unchecked spec item(s) remain after implementation"
+      exit 1
+    fi
+  fi
+
+  if [ -n "$VERIFY_CMD" ]; then
+    echo "🔍 Running verify: $VERIFY_CMD"
+    VERIFY_STATUS=0
+    VERIFY_OUTPUT=$(run_with_timeout "$VERIFY_TIMEOUT" sh -c "$VERIFY_CMD" 2>&1) || VERIFY_STATUS=$?
+    if [ "$VERIFY_STATUS" -ne 0 ]; then
+      [ "$VERIFY_STATUS" -eq 142 ] && VERIFY_NOTE="timed out after ${VERIFY_TIMEOUT}s" || VERIFY_NOTE="exit $VERIFY_STATUS"
+      REASON="Verify failed ($VERIFY_NOTE). Last output: $(echo "$VERIFY_OUTPUT" | tail -15)"
+      echo "❌ $REASON"
+      save_note "$TASK_ID" "$REASON"
+      exit 1
+    fi
+    echo "  ✅ Verify passed."
+  fi
+
+  NEW_TREE=""
+  [ -n "$REVIEW$UI_VERIFY" ] && NEW_TREE=$(snapshot_tree)
+
+  if [ -n "$REVIEW" ]; then
+    echo "🧐 Reviewing diff (${REVIEW_RUNNER:-$RUNNER})..."
+    DIFF=$(git diff "$BASE_TREE" "$NEW_TREE")
+    [ -z "$DIFF" ] && DIFF=$(git diff HEAD "$NEW_TREE")
+    if [ -z "$DIFF" ]; then
+      REASON="Review: no changes were made for this task"
+      echo "❌ $REASON"
+      save_note "$TASK_ID" "$REASON"
+      exit 1
+    fi
+    if [ "${#DIFF}" -gt "$REVIEW_MAX_DIFF" ]; then
+      DIFF="${DIFF[1,$REVIEW_MAX_DIFF]}
+...[diff truncated at $REVIEW_MAX_DIFF chars; read the files for the rest]"
+    fi
+    REVIEW_PROMPT="$(cat "$REVIEW_PROMPT_FILE")
+
+TASK: ${TASK_TASK:-$TASK_TITLE}
+TICKET: ${TASK_PARENT:-$TASK_ID}
+SPEC: @$TASK_SPEC
+FILES IN SCOPE: $TASK_FILES
+
+DIFF:
+$DIFF"
+    REVIEW_FILE=$(mktemp)
+    ${=REVIEW_RUNNER:-$RUNNER} ${=REVIEW_RUNNER_ARGS} -p "$REVIEW_PROMPT" | tee "$REVIEW_FILE" || true
+    REVIEW_OUT=$(perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/\e\][^\a]*(?:\a|\e\\)//g; s/\r//g' "$REVIEW_FILE"); rm -f "$REVIEW_FILE"
+    VERDICT=$(echo "$REVIEW_OUT" | grep -oE '^[[:space:]]*(<approved/>|<rejected>)' | tail -n 1 || true)
+    if [[ "$VERDICT" == *"<approved/>"* ]]; then
+      echo "  ✅ Review approved."
+    else
+      REASON=$(echo "$REVIEW_OUT" | tr '\n' ' ' | grep -o '<rejected>.*</rejected>' | tail -n 1 | sed 's/<rejected>//;s/<\/rejected>//' || true)
+      [ -n "$REASON" ] || REASON="no valid verdict from reviewer: $(echo "$REVIEW_OUT" | tail -n 5)"
+      REASON="Review rejected: $REASON"
+      echo "❌ $REASON"
+      save_note "$TASK_ID" "$REASON"
+      exit 1
+    fi
+  fi
+
+  if [ -n "$UI_VERIFY" ]; then
+    CHANGED=$(git diff --name-only "$BASE_TREE" "$NEW_TREE")
+    if [ -z "$UI_PATHS" ] || echo "$CHANGED" | grep -qE "$UI_PATHS"; then
+      echo "🖥️  UI verification..."
+      UI_BRIEF="Task '$TASK_ID' (ticket '${TASK_PARENT:-$TASK_ID}'): ${TASK_TASK:-$TASK_TITLE}
+Spec: $TASK_SPEC
+Changed files:
+$CHANGED"
+      UI_FILE=$(mktemp)
+      UI_STATUS=0
+      "$_AI_HOME/bin/ui-verify" "$UI_BRIEF" > "$UI_FILE" 2>&1 || UI_STATUS=$?
+      UI_OUT=$(cat "$UI_FILE"); rm -f "$UI_FILE"
+      echo "$UI_OUT"
+      if [ "$UI_STATUS" -ne 0 ]; then
+        [ "$UI_STATUS" -eq 1 ] && UI_WORD="FAIL" || UI_WORD="BLOCKED"
+        REASON="UI verification $UI_WORD: $(echo "$UI_OUT" | tr '\n' ' ' | cut -c1-1500)"
+        echo "❌ UI verification $UI_WORD"
+        save_note "$TASK_ID" "$REASON"
+        exit 1
+      fi
+      echo "  ✅ UI verified."
+    else
+      echo "🖥️  UI verification skipped (no UI paths changed)."
+    fi
+  fi
+
+  # Mark done, unblock dependents, strip orphaned blocked_by ids.
+  TMP_PRD=$(mktemp)
+  jq --arg id "$TASK_ID" '
+    (.issues[] | select(.id == $id)).status = "done" |
+    (.issues | map(.id)) as $all_ids |
+    .issues |= map(
+      if .status == "blocked" then
+        .blocked_by |= map(select(. != $id and (. as $bid | $all_ids | index($bid) != null))) |
+        if (.blocked_by | length == 0) then .status = "pending" else . end
+      else . end
+    )
+  ' "$PRD_FILE" > "$TMP_PRD" && mv "$TMP_PRD" "$PRD_FILE"
+  echo "✅ $TASK_ID done. Downstream tasks unblocked."
+
+  # Decide on commit before archival removes entries.
+  SHOULD_COMMIT=false
+  COMMIT_MSG=""
+  if [ -n "$TASK_PARENT" ]; then
+    REMAINING_IN_TICKET=$(jq --arg p "$TASK_PARENT" \
+      '[.issues[] | select(.parent == $p and .status != "done")] | length' "$PRD_FILE")
+    if [ "$REMAINING_IN_TICKET" -eq 0 ]; then
+      TICKET_TITLE=$(grep -m1 '^# ' "$TASK_SPEC" 2>/dev/null | sed 's/^# //' || true)
+      [ -n "$TICKET_TITLE" ] || TICKET_TITLE="$TASK_PARENT"
+      SHOULD_COMMIT=true
+      COMMIT_MSG="$COMMIT_TYPE($TASK_PARENT): $TICKET_TITLE"
+    fi
+  else
+    SHOULD_COMMIT=true
+    COMMIT_MSG="$COMMIT_TYPE($TASK_ID): $TASK_TITLE"
+  fi
+
+  # Feature archival: group = parent minus trailing -NN.
+  FEATURE_GROUP=$(echo "$TASK_PARENT" | sed 's/-[0-9][0-9]$//')
+  if [ -n "$FEATURE_GROUP" ]; then
+    FEATURE_PREFIX="${FEATURE_GROUP}-"
+    REMAINING=$(jq --arg p "$FEATURE_PREFIX" \
+      '[.issues[] | select((.id | startswith($p)) and .status != "done")] | length' "$PRD_FILE")
+    if [ "$REMAINING" -eq 0 ]; then
+      DONE_COUNT=$(jq --arg p "$FEATURE_PREFIX" \
+        '[.issues[] | select(.id | startswith($p))] | length' "$PRD_FILE")
+      SPEC_FILE="$SPECS_DIR/${FEATURE_GROUP}/spec.md"
+      FEATURE_TITLE="$FEATURE_GROUP"
+      FEATURE_SUMMARY=""
+      if [ -f "$SPEC_FILE" ]; then
+        FEATURE_TITLE=$(grep -m1 '^# ' "$SPEC_FILE" | sed 's/^# //' || echo "$FEATURE_GROUP")
+        FEATURE_SUMMARY=$(awk '/^## Solution/{found=1; next} found && /^## /{exit} found{print}' \
+          "$SPEC_FILE" | sed '/^[[:space:]]*$/d' | head -6 | tr '\n' ' ')
+      fi
+      {
+        printf '\n## %s\n' "$FEATURE_TITLE"
+        printf 'Completed: %s | Tasks: %d\n' "$(date +%Y-%m-%d)" "$DONE_COUNT"
+        [ -n "$FEATURE_SUMMARY" ] && printf '\n%s\n' "$FEATURE_SUMMARY"
+        printf '\n---\n'
+      } >> "$PROGRESS_FILE"
+      TMP_PRD=$(mktemp)
+      jq --arg p "$FEATURE_PREFIX" '.issues |= map(select(.id | startswith($p) | not))' \
+        "$PRD_FILE" > "$TMP_PRD" && mv "$TMP_PRD" "$PRD_FILE"
+      echo "🗄️  Feature '$FEATURE_GROUP' complete — $DONE_COUNT tasks archived to $PROGRESS_FILE"
+    fi
+  fi
+
+  if [ "$SHOULD_COMMIT" = true ]; then
+    echo "📦 Committing: $COMMIT_MSG"
+    git add -A
+    if git diff --cached --quiet; then
+      echo "⚠️  Nothing staged — skipping commit for $COMMIT_MSG"
+    else
+      git commit -m "$COMMIT_MSG"
+    fi
+  fi
+
+  echo "♻️ Resetting context window for next task..."
+  sleep 1
+done
+
+echo "🛑 Reached max iterations ($MAX_ITERATIONS). Run again to continue."

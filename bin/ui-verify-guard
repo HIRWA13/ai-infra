@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""PreToolUse hook for ui-verify: block Bash commands that could change the repo or data. Exit 2 = block."""
+import json, re, sys
+
+_in = json.load(sys.stdin)
+cmd = (_in.get("tool_input") or {}).get("command", "")
+SAFE_PATH = re.compile(r"^(/tmp/|/private/tmp/|/var/folders/|/private/var/folders/|/dev/|&|\$\{?(?!HOME\b|PWD\b|OLDPWD\b)\w+\}?/)")
+
+def block(why):
+    print(f"ui-verify guard blocked: {why}. The verifier is read-only; report instead.", file=sys.stderr)
+    sys.exit(2)
+
+if _in.get("tool_name", "").endswith("take_screenshot"):
+    fp = (_in.get("tool_input") or {}).get("filePath", "")
+    if not re.match(r"^(/tmp/|/private/tmp/|/var/folders/|/private/var/folders/)", fp):
+        block("take_screenshot must pass filePath under /tmp (inline images blow the request size limit)")
+    sys.exit(0)
+
+if re.search(r"\bgit\s+(commit|add|reset|checkout|restore|stash|clean|rebase|merge|push|pull|apply|rm|mv|cherry-pick|revert|tag|branch\s+-[dD])\b", cmd):
+    block("git write command")
+if re.search(r"\bsed\s+(-\w*i|--in-place)|\bperl\s+-\w*i", cmd):
+    block("in-place edit")
+if re.search(r"db:reset|db:push|db:migrate|\bmigrate\b|drizzle-kit\s+(push|migrate|drop)|\bprisma\s+(migrate|db)\b|\bdrop\s+(table|database|schema)\b|\btruncate\b|\bdelete\s+from\b", cmd, re.I):
+    block("database-changing command")
+if re.search(r"\b(pnpm|npm|yarn|bun)\s+(add|remove|rm|install|i|update|up|uninstall)\b", cmd):
+    block("dependency change")
+for m in re.finditer(r"(?<![0-9&<])>>?\s*(\S+)", cmd):
+    if not SAFE_PATH.match(m.group(1).strip("\"'")):
+        block(f"redirect into {m.group(1)}")
+if re.search(r"\b(tee|cp|mv|touch|mkdir|ln|chmod|truncate|dd)\b", cmd):
+    for tok in re.split(r"\s+", cmd):
+        if tok.startswith("/") or tok.startswith("./") or tok.startswith("~") or tok.startswith(".."):
+            if not SAFE_PATH.match(tok.strip("\"'")):
+                block(f"write-capable command touching {tok}")
+if re.search(r"\brm\b", cmd):
+    for tok in re.split(r"\s+", cmd):
+        if tok and not tok.startswith("-") and tok != "rm" and not re.match(r"^[;&|]+$", tok):
+            if not SAFE_PATH.match(tok.strip("\"';&|")):
+                block(f"rm of {tok}")
+sys.exit(0)
