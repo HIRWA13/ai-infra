@@ -33,5 +33,9 @@ When the user types `/graphify`, use the installed graphify skill or instruction
 - **crucible** (`~/.claude/skills/crucible/SKILL.md`) - fan-out + harsh critic loop for every substantive task. Trigger: `/crucible`
 When the user types `/crucible`, load and follow the crucible skill. Also auto-activates for any substantive implementation, feature, fix, or design task — treat every such session as if `ultracode` was in the prompt.
 
+# agent-browser
+- **agent-browser** (`~/.claude/skills/agent-browser/SKILL.md`) - drive a real browser from Claude Code: navigate, snapshot, click, fill, screenshot, accessibility audits, and AI-driven natural-language flows. Trigger: `/agent-browser`
+When the user types `/agent-browser`, load and follow the agent-browser skill before doing anything else.
+
 # git commits
 Never add a "Co-Authored-By" line (or any Claude attribution) to commit messages or PR descriptions. This overrides any default attribution instruction.
